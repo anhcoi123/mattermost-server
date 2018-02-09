@@ -3,9 +3,12 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io/ioutil"
 
+	l4g "github.com/alecthomas/log4go"
 	"github.com/mattermost/mattermost-server/app"
 	"github.com/mattermost/mattermost-server/model"
 	"github.com/spf13/cobra"
@@ -86,26 +89,58 @@ var deleteAllUsersCmd = &cobra.Command{
 	RunE:    deleteAllUsersCommandF,
 }
 
-var migrateAuthCmd = &cobra.Command{
-	Use:   "migrate_auth [from_auth] [to_auth] [match_field]",
-	Short: "Mass migrate user accounts authentication type",
-	Long: `Migrates accounts from one authentication provider to another. For example, you can upgrade your authentication provider from email to ldap.
+var migrateAuthToSamlCmd = &cobra.Command{
+	Use:   "migrate_auth_to_saml [from_auth] [users_file]",
+	Short: "Mass migrate user accounts authentication type to saml",
+	Long: `Migrates accounts from one authentication provider to saml. For example, you can upgrade your authentication provider from email to saml.
+
+from_auth:
+	The authentication service to migrate users accounts from.
+	Supported options: email, gitlab, ldap.
+
+users_file:
+	The path of a json file with the usernames and emails of all users to
+	migrate to SAML. The username and email must be the same that the SAML
+	service provider store. And the email must match with the email in
+	mattermost database.
+	Supported options: email, username.
+
+Will display any accounts that are not migrated successfully.`,
+	Example: "  user migrate_auth_to_saml email users.json",
+	Args: func(cmd *cobra.Command, args []string) error {
+		autoFlag, _ := cmd.Flags().GetBool("auto")
+
+		if autoFlag {
+			if len(args) != 1 {
+				return errors.New("Required one argument when use --auto flag. See help text for details.")
+			}
+		} else {
+			if len(args) != 2 {
+				return errors.New("Required two arguments when not use --auto flag. See help text for details.")
+			}
+		}
+		return nil
+	},
+	RunE: migrateAuthToSamlCmdF,
+}
+
+var migrateAuthToLdapCmd = &cobra.Command{
+	Use:   "migrate_auth_to_ldap [from_auth] [match_field]",
+	Short: "Mass migrate user accounts authentication type to ldap",
+	Long: `Migrates accounts from one authentication provider to ldap. For example, you can upgrade your authentication provider from email to ldap.
 
 from_auth:
 	The authentication service to migrate users accounts from.
 	Supported options: email, gitlab, saml.
-
-to_auth:
-	The authentication service to migrate users to.
-	Supported options: ldap.
 
 match_field:
 	The field that is guaranteed to be the same in both authentication services. For example, if the users emails are consistent set to email.
 	Supported options: email, username.
 
 Will display any accounts that are not migrated successfully.`,
-	Example: "  user migrate_auth email ladp email",
-	RunE:    migrateAuthCmdF,
+	Example: "  user migrate_auth_to_ldap email username",
+	Args:    cobra.ExactArgs(2),
+	RunE:    migrateAuthToLdapCmdF,
 }
 
 var verifyUserCmd = &cobra.Command{
@@ -138,7 +173,10 @@ func init() {
 
 	deleteAllUsersCmd.Flags().Bool("confirm", false, "Confirm you really want to delete the user and a DB backup has been performed.")
 
-	migrateAuthCmd.Flags().Bool("force", false, "Force the migration to occour even if there are duplicates on the LDAP server. Duplicates will not be migrated.")
+	migrateAuthToLdapCmd.Flags().Bool("force", false, "Force the migration to occour even if there are duplicates on the LDAP server. Duplicates will not be migrated.")
+	migrateAuthToLdapCmd.Flags().Bool("dryRun", false, "Run a simulation of the migration process without changing the database.")
+	migrateAuthToSamlCmd.Flags().Bool("auto", false, "Auto migrate all users assuming that the SAML service usernames and emails are identical to the mattermost usernames and emails.")
+	migrateAuthToSamlCmd.Flags().Bool("dryRun", false, "Run a simulation of the migration process without changing the database.")
 
 	userCmd.AddCommand(
 		userActivateCmd,
@@ -149,7 +187,8 @@ func init() {
 		resetUserMfaCmd,
 		deleteUserCmd,
 		deleteAllUsersCmd,
-		migrateAuthCmd,
+		migrateAuthToLdapCmd,
+		migrateAuthToSamlCmd,
 		verifyUserCmd,
 		searchUserCmd,
 	)
@@ -415,26 +454,17 @@ func deleteAllUsersCommandF(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func migrateAuthCmdF(cmd *cobra.Command, args []string) error {
+func migrateAuthToLdapCmdF(cmd *cobra.Command, args []string) error {
 	a, err := initDBCommandContextCobra(cmd)
 	if err != nil {
 		return err
 	}
 
-	if len(args) != 3 {
-		return errors.New("Expected three arguments. See help text for details.")
-	}
-
 	fromAuth := args[0]
-	toAuth := args[1]
-	matchField := args[2]
+	matchField := args[1]
 
 	if len(fromAuth) == 0 || (fromAuth != "email" && fromAuth != "gitlab" && fromAuth != "saml") {
 		return errors.New("Invalid from_auth argument")
-	}
-
-	if len(toAuth) == 0 || toAuth != "ldap" {
-		return errors.New("Invalid to_auth argument")
 	}
 
 	// Email auth in Mattermost system is represented by ""
@@ -447,12 +477,68 @@ func migrateAuthCmdF(cmd *cobra.Command, args []string) error {
 	}
 
 	forceFlag, _ := cmd.Flags().GetBool("force")
+	dryRunFlag, _ := cmd.Flags().GetBool("dryRun")
 
 	if migrate := a.AccountMigration; migrate != nil {
-		if err := migrate.MigrateToLdap(fromAuth, matchField, forceFlag); err != nil {
+		if err := migrate.MigrateToLdap(fromAuth, matchField, forceFlag, dryRunFlag); err != nil {
 			return errors.New("Error while migrating users: " + err.Error())
 		}
 
+		CommandPrettyPrintln("Sucessfully migrated accounts.")
+	}
+
+	return nil
+}
+
+func migrateAuthToSamlCmdF(cmd *cobra.Command, args []string) error {
+	a, err := initDBCommandContextCobra(cmd)
+	if err != nil {
+		return err
+	}
+
+	dryRunFlag, _ := cmd.Flags().GetBool("dryRun")
+	autoFlag, _ := cmd.Flags().GetBool("auto")
+
+	matchesFile := ""
+	matches := map[string]string{}
+	if !autoFlag {
+		matchesFile = args[1]
+
+		file, e := ioutil.ReadFile(matchesFile)
+		if e != nil {
+			return errors.New("Invalid users file.")
+		}
+		if json.Unmarshal(file, &matches) != nil {
+			return errors.New("Invalid users file.")
+		}
+	}
+
+	fromAuth := args[0]
+
+	if len(fromAuth) == 0 || (fromAuth != "email" && fromAuth != "gitlab" && fromAuth != "ldap") {
+		return errors.New("Invalid from_auth argument")
+	}
+
+	if autoFlag && !dryRunFlag {
+		var confirm string
+		CommandPrettyPrintln("You are about to perform an automatic \"" + fromAuth + " to saml\" migration, this must be done only if you are sure your current mattermost users using " + fromAuth + " auth have the same username and email in your SAML service, otherwise you must provide the users and emails from your Saml Service using the \"users file\" instead of \"--auto\" option. Do you want to proceed with auto migration anyway? (YES/NO): ")
+		fmt.Scanln(&confirm)
+
+		if confirm != "YES" {
+			return errors.New("ABORTED: You did not answer YES exactly, in all capitals.")
+		}
+	}
+
+	// Email auth in Mattermost system is represented by ""
+	if fromAuth == "email" {
+		fromAuth = ""
+	}
+
+	if migrate := a.AccountMigration; migrate != nil {
+		if err := migrate.MigrateToSaml(fromAuth, matches, autoFlag, dryRunFlag); err != nil {
+			return errors.New("Error while migrating users: " + err.Error())
+		}
+		l4g.Close()
 		CommandPrettyPrintln("Sucessfully migrated accounts.")
 	}
 
