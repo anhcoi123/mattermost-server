@@ -66,7 +66,7 @@ func UpgradeDatabase(sqlStore SqlStore) {
 	UpgradeDatabaseToVersion46(sqlStore)
 	//UpgradeDatabaseToVersion47(sqlStore)
 	//UpgradeDatabaseToVersion48(sqlStore)
-
+	saveSchemaVersion(sqlStore, VERSION_4_6_0)
 	// If the SchemaVersion is empty this this is the first time it has ran
 	// so lets set it to the current version.
 	if sqlStore.GetCurrentSchemaVersion() == "" {
